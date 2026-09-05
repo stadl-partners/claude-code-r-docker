@@ -1,0 +1,6 @@
+.env
+.Renviron
+*.json
+*.pem
+*.key
+.DS_Store
