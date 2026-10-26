@@ -1,0 +1,132 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable",
+    "blockReadsOutsideWorkingDirectories": true,
+    "allow": [
+      "Bash(r-deps)",
+      "Bash(r-pkg *)",
+      "Bash(Rscript -e \"renv::status()\")",
+      "Bash(Rscript -e \"devtools::test()\")",
+      "Bash(Rscript -e \"devtools::check()\")"
+    ],
+    "ask": [
+      "WebFetch",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git tag *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./.Renviron)",
+      "Read(./**/.Renviron)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+      "Write(./**/.env)",
+      "Write(./**/.env.*)",
+      "Write(./.Renviron)",
+      "Write(./**/.Renviron)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(./**/.env)",
+      "Edit(./**/.env.*)",
+      "Edit(./.Renviron)",
+      "Edit(./**/.Renviron)",
+      "Bash(sudo *)",
+      "Bash(su *)",
+      "Bash(docker *)",
+      "Bash(podman *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)"
+    ]
+  },
+  "allowManagedPermissionRulesOnly": true,
+  "allowManagedHooksOnly": true,
+  "allowedMcpServers": [],
+  "allowManagedMcpServersOnly": true,
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "enableWeakerNestedSandbox": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
+    "filesystem": {
+      "allowManagedReadPathsOnly": true,
+      "allowRead": [
+        "/workspace/",
+        "/state/r-cache/"
+      ],
+      "allowWrite": [
+        "/workspace/",
+        "/state/r-cache/",
+        "/tmp/"
+      ],
+      "denyRead": [
+        "/state/home/",
+        "/proc/",
+        "/workspace/.env",
+        "/workspace/.env.*",
+        "/workspace/**/.env",
+        "/workspace/**/.env.*",
+        "/workspace/.Renviron",
+        "/workspace/**/.Renviron",
+        "/workspace/**/*.pem",
+        "/workspace/**/*.key"
+      ],
+      "denyWrite": [
+        "/etc/",
+        "/opt/",
+        "/usr/",
+        "/state/home/"
+      ]
+    },
+    "network": {
+      "allowManagedDomainsOnly": true,
+      "allowedDomains": [
+        "cloud.r-project.org",
+        "cran.r-project.org",
+        "*.r-project.org",
+        "packagemanager.posit.co",
+        "*.posit.co",
+        "bioconductor.org",
+        "*.bioconductor.org",
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "raw.githubusercontent.com",
+        "*.githubusercontent.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "*.r-universe.dev",
+        "pypi.org",
+        "files.pythonhosted.org"
+      ],
+      "allowAllUnixSockets": false
+    }
+  },
+  "allowedHttpHookUrls": [],
+  "deniedMcpServers": [
+    {
+      "serverName": "claude-in-chrome"
+    },
+    {
+      "serverName": "computer-use"
+    },
+    {
+      "serverName": "ide"
+    }
+  ],
+  "strictKnownMarketplaces": [],
+  "strictPluginOnlyCustomization": true,
+  "disableSideloadFlags": true,
+  "disableCommandPluginSources": true,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
+  "disableRemoteControl": true,
+  "crossSessionInbound": "refuse"
+}

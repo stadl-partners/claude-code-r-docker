@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -eq 0 ]]; then
+  echo "Usage: r-pkg <package-or-pak-reference> [more ...]" >&2
+  exit 2
+fi
+
+cd /workspace
+exec Rscript --vanilla -e 'options(repos = c(CRAN = "https://cloud.r-project.org")); pak::pkg_install(commandArgs(trailingOnly = TRUE), upgrade = FALSE, ask = FALSE)' --args "$@"

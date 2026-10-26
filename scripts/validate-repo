@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+jq empty "$ROOT/config/managed-settings.json"
+
+# Image must finish as the dedicated non-root user.
+grep -q '^USER ruser$' "$ROOT/Dockerfile"
+[[ "$(grep -c '^USER ruser$' "$ROOT/Dockerfile")" -ge 1 ]]
+grep -q 'ARG USER_ID=1000' "$ROOT/Dockerfile"
+grep -q 'ARG GROUP_ID=1000' "$ROOT/Dockerfile"
+
+# Launcher hardening.
+grep -q -- '--cap-drop=ALL' "$ROOT/ccode"
+grep -q -- '--read-only' "$ROOT/ccode"
+grep -q -- '--security-opt=no-new-privileges:true' "$ROOT/ccode"
+grep -q 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' "$ROOT/ccode"
+grep -q 'R_ENVIRON_USER=/dev/null' "$ROOT/ccode"
+grep -q 'type=volume,source=claude-code-r-state,target=/state' "$ROOT/ccode"
+
+# Exactly one host bind mount, and it must be the current project -> /workspace.
+[[ "$(grep -c 'type=bind' "$ROOT/ccode")" -eq 1 ]]
+grep -Fq 'type=bind,source=${PROJECT_DIR},target=/workspace' "$ROOT/ccode"
+grep -q -- '--add-dir' "$ROOT/ccode"
+grep -q -- '--mcp-config' "$ROOT/ccode"
+
+# Managed policy must fail closed and block project/user policy expansion.
+jq -e '
+  .permissions.disableBypassPermissionsMode == "disable" and
+  .permissions.blockReadsOutsideWorkingDirectories == true and
+  .allowManagedPermissionRulesOnly == true and
+  .allowManagedHooksOnly == true and
+  .allowManagedMcpServersOnly == true and
+  (.allowedMcpServers | length == 0) and
+  .sandbox.enabled == true and
+  .sandbox.failIfUnavailable == true and
+  .sandbox.allowUnsandboxedCommands == false and
+  .sandbox.filesystem.allowManagedReadPathsOnly == true and
+  .sandbox.network.allowManagedDomainsOnly == true and
+  (.strictKnownMarketplaces | length == 0) and
+  .strictPluginOnlyCustomization == true and
+  .disableSideloadFlags == true and
+  .disableCommandPluginSources == true and
+  .syncClaudeAiSkills == false and
+  .syncClaudeAiPlugins == false and
+  .disableRemoteControl == true and
+  .crossSessionInbound == "refuse"
+' "$ROOT/config/managed-settings.json" >/dev/null
+
+if grep -Eq '(~/.ssh|~/.aws|docker\.sock|--privileged|--cap-add|--network=host|--user[ =]root)' "$ROOT/ccode"; then
+  echo "ERROR: forbidden host/security mount or privilege option found in ccode" >&2
+  exit 1
+fi
+
+if grep -Eq '(^|[[:space:]])(sudo|su)([[:space:]]|$)' "$ROOT/scripts/claude-r-entrypoint"; then
+  echo "ERROR: entrypoint must not elevate privileges" >&2
+  exit 1
+fi
+
+grep -q 'ARG R_VERSION=4.3.2' "$ROOT/Dockerfile"
+grep -q 'libtbb-dev' "$ROOT/Dockerfile"
+grep -q 'libv8-dev' "$ROOT/Dockerfile"
+grep -q 'r-full-4.3.2' "$ROOT/.github/workflows/docker-build.yml"
+echo "Static validation passed for r-full-4.3.2."

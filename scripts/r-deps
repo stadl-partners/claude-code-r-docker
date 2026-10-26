@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace
+
+if [[ -f renv.lock ]]; then
+  exec Rscript --vanilla -e 'options(repos = c(CRAN = "https://cloud.r-project.org")); renv::restore(prompt = FALSE)'
+fi
+
+if [[ -f DESCRIPTION ]]; then
+  exec Rscript --vanilla -e 'options(repos = c(CRAN = "https://cloud.r-project.org")); pak::local_install_dev_deps(".", upgrade = FALSE, ask = FALSE)'
+fi
+
+echo "No renv.lock or DESCRIPTION found." >&2
+echo "Use: r-pkg <package> [package ...] for ad-hoc package installation." >&2
+exit 2
