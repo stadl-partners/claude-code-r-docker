@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+if [[ "$(id -u)" == "0" ]]; then
+  echo "ERROR: refusing to run Claude Code as root." >&2
+  exit 77
+fi
+
+if [[ "$(pwd -P)" != "/workspace" ]]; then
+  cd /workspace
+fi
+
+if [[ ! -d /workspace || ! -r /workspace ]]; then
+  echo "ERROR: /workspace is not readable." >&2
+  exit 74
+fi
+
+if [[ ! -w /workspace ]]; then
+  echo "ERROR: /workspace is not writable by uid $(id -u)." >&2
+  echo "On Linux, rebuild with --build-arg USER_ID=$(id -u) --build-arg GROUP_ID=$(id -g); do not run the container as root." >&2
+  exit 73
+fi
+
+mkdir -p /state/home /state/r-cache/library /state/r-cache/R /state/r-cache/renv
+
+exec /usr/local/bin/claude "$@"

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "deny": [
+      "WebFetch",
+      "Read(.env)",
+      "Read(.Renviron)",
+      "Read(*.json)",
+      "Read(*.pem)",
+      "Read(*.key)",
+      "Write(.env)",
+      "Write(.Renviron)"
+    ],
+    "allow": [
+      "Bash(Rscript -e \"renv::status()\")",
+      "Bash(Rscript -e \"renv::restore()\")",
+      "Bash(Rscript -e \"devtools::test()\")",
+      "Bash(Rscript -e \"devtools::check()\")"
+    ],
+    "ask": [
+      "Bash(Rscript -e \"renv::install(*)\")",
+      "Bash(Rscript -e \"renv::snapshot(*)\")"
+    ]
+  }
+}

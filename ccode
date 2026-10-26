@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The registry image is built by GitHub Actions; never build it locally.
+# Example: export CLAUDE_R_IMAGE=ghcr.io/my-org/my-repo:r-full-4.3.2
+IMAGE="${CLAUDE_R_IMAGE:-}"
+if [[ -z "$IMAGE" ]]; then
+  echo "ERROR: set CLAUDE_R_IMAGE=ghcr.io/<org>/<repo>:r-full-4.3.2" >&2
+  exit 64
+fi
+
+# The profile is fixed for this release; override the image explicitly for a different stack.
+if [[ "${1:-}" == "--profile" || "${1:-}" == --profile=* ]]; then
+  echo "ERROR: this launcher targets r-full-4.3.2; select a different image via CLAUDE_R_IMAGE." >&2
+  exit 64
+fi
+PROJECT_DIR="$(pwd -P)"
+HOME_DIR="${HOME:-}"
+
+case "$PROJECT_DIR" in
+  /|/home|/Users|/root)
+    echo "ERROR: refusing to mount a broad system directory: $PROJECT_DIR" >&2
+    exit 64
+    ;;
+esac
+
+if [[ -n "$HOME_DIR" && "$PROJECT_DIR" == "$(cd "$HOME_DIR" 2>/dev/null && pwd -P)" ]]; then
+  echo "ERROR: refusing to mount your entire home directory." >&2
+  exit 64
+fi
+
+if [[ "$PROJECT_DIR" == *$'\n'* || "$PROJECT_DIR" == *','* ]]; then
+  echo "ERROR: project path contains a newline or comma; move the project to a simpler path before mounting it." >&2
+  exit 64
+fi
+
+# Do not let per-invocation CLI flags widen the filesystem/configuration boundary.
+for arg in "$@"; do
+  case "$arg" in
+    --add-dir|--add-dir=*|--settings|--settings=*|--setting-sources|--setting-sources=*|\
+    --allowedTools|--allowedTools=*|--disallowedTools|--disallowedTools=*|\
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|\
+    --plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|--agents|--agents=*|\
+    --mcp-config|--mcp-config=*)
+      echo "ERROR: refusing Claude CLI option that can widen or replace the managed security boundary: $arg" >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [[ "${CLAUDE_R_ALLOW_ANY_DIR:-0}" != "1" ]]; then
+  shopt -s nullglob
+  rproj=( *.Rproj )
+  if [[ ! -f renv.lock && ! -f DESCRIPTION && ! -d R && ! -d tests && ! -d .git && ${#rproj[@]} -eq 0 ]]; then
+    echo "ERROR: this does not look like an R project." >&2
+    echo "Run from the project root, or set CLAUDE_R_ALLOW_ANY_DIR=1 deliberately." >&2
+    exit 64
+  fi
+fi
+
+DOCKER_ARGS=(
+  run --rm -it --init
+  --workdir /workspace
+  --read-only
+  --cap-drop=ALL
+  --security-opt=no-new-privileges:true
+  --pids-limit=512
+  --network=bridge
+  --mount "type=bind,source=${PROJECT_DIR},target=/workspace"
+  --mount "type=volume,source=claude-code-r-state,target=/state"
+  --tmpfs /tmp:rw,nosuid,nodev,size=2g
+  -e HOME=/state/home
+  -e DISABLE_AUTOUPDATER=1
+  -e CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
+  -e R_ENVIRON_USER=/dev/null
+  -e R_LIBS_USER=/state/r-cache/library
+  -e R_USER_CACHE_DIR=/state/r-cache/R
+  -e RENV_PATHS_CACHE=/state/r-cache/renv
+  -e RENV_CONFIG_PAK_ENABLED=TRUE
+  -e RENV_CONFIG_AUTO_SNAPSHOT=FALSE
+)
+
+# No host credentials are forwarded by default.
+# Explicit opt-in for API-key users. Subscription/OAuth login is preferred.
+if [[ "${CLAUDE_R_USE_API_KEY:-0}" == "1" ]]; then
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "ERROR: CLAUDE_R_USE_API_KEY=1 but ANTHROPIC_API_KEY is not set." >&2
+    exit 65
+  fi
+  DOCKER_ARGS+=( -e ANTHROPIC_API_KEY )
+fi
+
+# Require explicit image pull, preventing an outdated local tag from being used.
+docker pull "$IMAGE"
+exec docker "${DOCKER_ARGS[@]}" "$IMAGE" "$@"

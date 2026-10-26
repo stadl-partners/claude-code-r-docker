@@ -1,6 +1,10 @@
 .env
+.env.*
 .Renviron
-*.json
 *.pem
 *.key
 .DS_Store
+.Rproj.user/
+.Rhistory
+.RData
+*.zip
