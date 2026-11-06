@@ -8,21 +8,19 @@ if [[ "$(id -u)" == "0" ]]; then
   exit 77
 fi
 
-if [[ "$(pwd -P)" != "/workspace" ]]; then
-  cd /workspace
-fi
+cd /workspace
 
-if [[ ! -d /workspace || ! -r /workspace ]]; then
-  echo "ERROR: /workspace is not readable." >&2
+if [[ ! -r /workspace ]]; then
+  echo "ERROR: /workspace is not readable by uid $(id -u)." >&2
   exit 74
 fi
 
 if [[ ! -w /workspace ]]; then
   echo "ERROR: /workspace is not writable by uid $(id -u)." >&2
-  echo "On Linux, rebuild with --build-arg USER_ID=$(id -u) --build-arg GROUP_ID=$(id -g); do not run the container as root." >&2
+  echo "Rebuild so the image user matches your host user (claude-r does this with HOST_UID/HOST_GID); do not run the container as root." >&2
   exit 73
 fi
 
-mkdir -p /state/home /state/r-cache/library /state/r-cache/R /state/r-cache/renv
+mkdir -p "${R_LIBS_USER:?}" "${R_USER_CACHE_DIR:?}" "${RENV_PATHS_CACHE:?}"
 
 exec /usr/local/bin/claude "$@"

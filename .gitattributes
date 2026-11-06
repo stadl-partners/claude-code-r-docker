@@ -1,0 +1,5 @@
+# Everything is LF so it works inside the Linux image and under bash (CRLF breaks shebangs and
+# the proxy's regex allowlist). Windows-only wrappers are CRLF.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

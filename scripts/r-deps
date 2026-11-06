@@ -2,12 +2,15 @@
 set -euo pipefail
 cd /workspace
 
+# No --vanilla: keep the site profile, which sets CRAN to the official mirror chosen at build time
+# (CRAN_REPO in the Dockerfile). --no-init-file skips the project .Rprofile, and
+# R_ENVIRON_USER=/dev/null disables user .Renviron files.
 if [[ -f renv.lock ]]; then
-  exec Rscript --vanilla -e 'options(repos = c(CRAN = "https://cloud.r-project.org")); renv::restore(prompt = FALSE)'
+  exec Rscript --no-init-file -e 'renv::restore(prompt = FALSE)'
 fi
 
 if [[ -f DESCRIPTION ]]; then
-  exec Rscript --vanilla -e 'options(repos = c(CRAN = "https://cloud.r-project.org")); pak::local_install_dev_deps(".", upgrade = FALSE, ask = FALSE)'
+  exec Rscript --no-init-file -e 'pak::local_install_dev_deps(".", upgrade = FALSE, ask = FALSE)'
 fi
 
 echo "No renv.lock or DESCRIPTION found." >&2

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Usage: scripts/smoke-test <claude-image> <proxy-image>
+# Checks a built image against the hardening invariants, with the same runtime flags as
+# docker-compose.yml, and checks that the proxy is the only way out.
+set -euo pipefail
+
+# Git Bash on Windows rewrites arguments like /etc/foo into C:/Program Files/Git/etc/foo before
+# docker sees them, which breaks every in-container path below. Turn that off.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
+
+CLAUDE_IMG="${1:?claude image}"
+PROXY_IMG="${2:?proxy image}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+FLAGS=(--rm --read-only --cap-drop=ALL --security-opt=no-new-privileges:true --tmpfs /tmp:rw,exec,nosuid,nodev,size=256m)
+run() { docker run "${FLAGS[@]}" --entrypoint "$1" "$CLAUDE_IMG" "${@:2}"; }
+ok()  { echo "ok   - $*"; }
+bad() { echo "FAIL - $*" >&2; exit 1; }
+
+# --- identity ---
+[[ "$(run id -un)" == "claude" ]] && ok "runs as user claude" || bad "user is not claude"
+[[ "$(run id -u)" != "0" ]] && ok "uid is not 0" || bad "uid is 0"
+run bash -c 'command -v sudo' >/dev/null 2>&1 && bad "sudo is installed" || ok "no sudo"
+
+# --- entrypoint refuses root ---
+set +e
+docker run --rm --user 0 "$CLAUDE_IMG" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" == "77" ]] && ok "entrypoint refuses uid 0 (exit 77)" || bad "entrypoint did not refuse root (exit $rc)"
+
+# --- pinned Claude Code ---
+want="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' "$ROOT/Dockerfile")"
+got="$(run claude --version)"
+[[ "$got" == "$want"* ]] && ok "claude --version = $got" || bad "claude is '$got', pinned '$want'"
+
+# --- R ---
+run R --version | head -1
+run Rscript -e 'library(renv); library(pak); library(devtools); library(testthat); cat("R tooling ok\n")'
+run Rscript -e 'stopifnot(grepl("r-project.org|ethz.ch", getOption("repos")[["CRAN"]]))' && ok "CRAN is an official mirror" || bad "CRAN repo is not an official mirror"
+
+# --- filesystem ---
+run bash -c '! touch /usr/local/probe 2>/dev/null' && ok "root filesystem is read-only" || bad "root filesystem is writable"
+echo "--- /etc/claude-code in image:"; run ls -la /etc/claude-code || true
+run bash -c '! (echo x >> /etc/claude-code/managed-settings.json) 2>/dev/null' && ok "managed settings not writable" || bad "managed settings writable"
+run test -r /etc/claude-code/managed-settings.json && ok "managed settings present" || bad "managed settings missing"
+run test -r /etc/claude-code/CLAUDE.md && ok "managed CLAUDE.md present" || bad "managed CLAUDE.md missing"
+run bwrap --version && ok "bubblewrap present" || bad "bubblewrap missing"
+
+# --- Stan-style compile: C++17 build in /tmp, then execute from /tmp (tmpfs must allow exec) ---
+run bash -c 'printf "%s\n" "#include <iostream>" "int main() { std::cout << \"cxx17 ok\" << std::endl; }" > /tmp/h.cpp && g++ -std=c++17 -O1 /tmp/h.cpp -o /tmp/h && /tmp/h' \
+  && ok "C++17 compile and run from /tmp" || bad "C++17 compile/run from /tmp failed"
+run Rscript -e 'stopifnot(pkgbuild::has_build_tools(debug = TRUE))' && ok "R build tools found" || bad "R build tools missing"
+
+# --- network: the only way out is the allowlist proxy ---
+net="smoke-int-$$" px="smoke-proxy-$$"
+cleanup() { docker rm -f "$px" >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+docker network create --internal "$net" >/dev/null
+docker run -d --name "$px" --network "$net" --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges:true "$PROXY_IMG" >/dev/null
+docker network connect bridge "$px"
+sleep 2
+
+curlc() { docker run "${FLAGS[@]}" --network "$net" --entrypoint curl "$CLAUDE_IMG" -sS -o /dev/null \
+  -w '%{http_code}' --max-time 20 "$@"; }
+
+code="$(curlc -x "http://$px:3128" https://cloud.r-project.org/ || true)"
+[[ "$code" =~ ^(200|301|302)$ ]] && ok "allowlisted host reachable via proxy ($code)" || bad "allowlisted host not reachable ($code)"
+
+code="$(curlc -x "http://$px:3128" https://example.com/ 2>/dev/null || true)"
+[[ ! "$code" =~ ^(200|301|302)$ ]] && ok "non-allowlisted host refused by proxy" || bad "non-allowlisted host reachable ($code)"
+
+code="$(curlc --noproxy '*' https://cloud.r-project.org/ 2>/dev/null || true)"
+[[ ! "$code" =~ ^(200|301|302)$ ]] && ok "direct internet access blocked" || bad "direct internet access works ($code)"
+
+echo "Smoke test passed."

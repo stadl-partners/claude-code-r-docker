@@ -1,53 +1,38 @@
 # Security notes
 
-## Host boundary
+## Boundaries, in order
 
-The security boundary is Docker first, Claude permissions second. The launcher bind-mounts only the current project directory. A Docker-managed named volume at `/state` is used for Claude login/session state and R package caches; it is not a host-path mount.
+1. **Docker.** Non-root user, read-only root filesystem, no capabilities, `no-new-privileges`, resource limits.
+2. **Network.** The `claude` container sits on an `internal` network. The only route out is the allowlist proxy (`proxy/`). Direct connections fail; non-allowlisted hosts get a 403 from the proxy.
+3. **Claude managed policy.** `/etc/claude-code/managed-settings.json` (root-owned, read-only): sandbox required and fail-closed, bypass mode disabled, reads outside the working directory blocked, repo/user hooks, MCP servers, plugins, remote control and cross-session access blocked.
 
-Because `/workspace` is a direct read-write bind, `.env` and `.Renviron` files inside that project are physically present in the container namespace even though Claude file tools and sandboxed subprocesses are denied their contents. Secrets committed into Git history or duplicated under another filename are not recoverably distinguishable from ordinary project data; remove such secrets from the repository/history rather than relying on this sandbox.
+Docker is the primary boundary; Claude's policy is defense in depth.
 
-Never add any of the following to `ccode`:
+## What is mounted
 
-- `/var/run/docker.sock`
-- `$HOME` or parent directories of the project
-- `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`
-- `.env` or `.Renviron` as explicit mounts
-- `--privileged`, `--cap-add`, `--network=host`, or `--user root`
+- The project directory, read-write, at `/workspace`.
+- `.git/hooks` and `.git/config` of that project, read-only (git executes them on the host). Disable with `CLAUDE_R_GIT_WRITABLE=1`.
+- The named volume `claude-home` at `/home/claude`: login state and R package cache.
 
-## Claude policy
+Never add to compose or the launcher: the Docker socket, `$HOME` or parents of the project, `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `--privileged`, `cap_add`, host networking, or a root user. `scripts/validate-repo` rejects these.
 
-Managed settings enforce the following:
+## Known limits
 
-- bypass permissions disabled
-- reads outside working directories blocked
-- Bash sandbox required and fail-closed
-- unsandboxed fallback disabled
-- project/user permission rules cannot replace managed permission rules
-- repository/user hooks, skills, agents, plugin marketplaces, and sideloaded plugins blocked
-- non-managed MCP servers blocked, including built-in browser/computer/IDE bridges
-- remote control and cross-session inbound access disabled
-- managed network allowlist for sandboxed commands
-- secret file patterns denied for file tools and Bash sandbox reads
+- **Secrets in the project.** Files like `.env` and `.Renviron` are present in the bind mount. Filename deny rules don't cover secrets in git history, copies under other names, or other project files. Use a sanitized copy for strong separation.
+- **Project `.Rprofile`** executes when R starts in `/workspace`. `r-deps` and `r-pkg` skip it; interactive `Rscript` calls don't. Other writable project files (`Makefile`, `.Rprofile`, package scripts) also run on your host if you run them there later.
+- **`/tmp` allows execution.** Docker mounts tmpfs `noexec` by default; it is `exec` here because R compiles Stan and Rcpp models into `tempdir()` and loads them from there. Code Claude writes to `/tmp` can therefore run.
+- **Nested sandbox.** Claude's bubblewrap sandbox runs inside Docker, which needs `enableWeakerNestedSandbox` in the managed settings. This is untested here; check that the sandbox actually starts.
+- **Proxy allowlist.** The proxy filters by hostname only. GitHub and PyPI hosts can carry arbitrary data, so the allowlist limits where data goes but doesn't make exfiltration impossible. Keep the list short. The managed settings have their own domain allowlist; keep the two consistent.
+- **API key mode** (`CLAUDE_R_USE_API_KEY=1`) puts the key in the Claude process environment. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` and the sandbox reduce exposure to child processes; they are not a hard boundary.
+- **Prebuilt GHCR images** use UID 1000 and are pulled by tag; prefer `@sha256:` references.
 
-`enableWeakerNestedSandbox` is enabled only because Claude's Linux bubblewrap sandbox is running inside an already-isolated, unprivileged Docker container. The outer Docker boundary remains the primary host-isolation control.
+## Supply chain
 
-## Authentication
+- Base images are pinned by digest. Claude Code is pinned by version and sha256 (`scripts/update-claude-pin`); the binary is verified at build time. GitHub Actions are pinned to commit SHAs.
+- R packages come from official CRAN (source, compiled in the image). Project dependencies belong in `renv.lock`; nothing pins the baseline packages (`renv`, `devtools`, `testthat`) to a date.
+- apt packages are not version-pinned. Rebuild picks up current Ubuntu security updates.
+- Not yet done: vulnerability scanning (e.g. Trivy), image signing, a Renovate config.
 
-No host credentials are forwarded by default. OAuth/Claude login state is stored in a Docker volume. If API-key mode is explicitly enabled, the Claude process necessarily receives the key; subprocess credential scrubbing plus filesystem restrictions reduce exposure to commands Claude runs.
+## R packages
 
-## R package installation
-
-R packages install as the non-root user. Common native build dependencies are preinstalled. If a package requires an OS library that is not present, rebuild the image with that library. Do not solve this by granting runtime root or adding `sudo`.
-
-## Explicit limitation of project bind mounts
-
-Only `/workspace` is host-bound. However all files in that project are exposed to the container namespace, even when filename-deny rules intend to block them. Avoid secrets **inside** the directory: use a sanitized working copy for the strongest separation, especially before running untrusted package installation scripts. Managed permissions are not a substitute for OS-level file removal.
-
-### Private GitHub Container Registry
-
-Publishing via Actions uses only the per-job `GITHUB_TOKEN` (`packages: write`).
-The registry package should stay **private**; confirm repository Actions access
-if the package name already exists. Developer machines authenticate directly
-to Docker/GHCR outside the container with `read:packages` and org SSO
-authorization where required. Never pass GHCR PATs into container `-e`, image
-build args, or files within `/workspace`.
+Packages install as the non-root user into `~/.local/share/R/library` (or the project's `renv` library). If one needs a missing system library, rebuild the image with it. Don't add sudo or runtime apt.
