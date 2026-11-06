@@ -4,6 +4,11 @@
 # 4.3.2 is the R version this image targets; change the tag and digest together.
 FROM rocker/r-ver:4.3.2@sha256:4e32addfc4da3e660f6e0d05ce5e43d3eceb9db58a60b9a142e0dde9a654ead1
 
+# Add metadata labels
+LABEL org.opencontainers.image.authors="Thomas Gsponer"
+LABEL r.version="4.3.2"
+LABEL description="Claude Code for R 4.3.2"
+
 # slim = core R build libraries; full = slim + geospatial, database, Stan/V8, image, Python.
 ARG R_STACK=full
 ARG DEBIAN_FRONTEND=noninteractive
