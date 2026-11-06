@@ -1,30 +1,81 @@
 #!/usr/bin/env bash
+# Static checks for the hardening invariants. Cheap guard against accidental regressions;
+# scripts/smoke-test checks the same things against a built image.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
 
-jq empty "$ROOT/config/managed-settings.json"
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
-# Image must finish as the dedicated non-root user.
-grep -q '^USER ruser$' "$ROOT/Dockerfile"
-[[ "$(grep -c '^USER ruser$' "$ROOT/Dockerfile")" -ge 1 ]]
-grep -q 'ARG USER_ID=1000' "$ROOT/Dockerfile"
-grep -q 'ARG GROUP_ID=1000' "$ROOT/Dockerfile"
+jq empty config/managed-settings.json
 
-# Launcher hardening.
-grep -q -- '--cap-drop=ALL' "$ROOT/ccode"
-grep -q -- '--read-only' "$ROOT/ccode"
-grep -q -- '--security-opt=no-new-privileges:true' "$ROOT/ccode"
-grep -q 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' "$ROOT/ccode"
-grep -q 'R_ENVIRON_USER=/dev/null' "$ROOT/ccode"
-grep -q 'type=volume,source=claude-code-r-state,target=/state' "$ROOT/ccode"
+# --- Dockerfile: dedicated non-root user, pinned inputs, verified Claude binary ---------------
+grep -q '^USER claude$' Dockerfile || fail "Dockerfile must end as USER claude"
+[[ "$(grep -E '^USER ' Dockerfile | tail -1)" == "USER claude" ]] || fail "last USER must be claude"
+grep -q '^ARG HOST_UID=1000$' Dockerfile
+grep -q '^ARG HOST_GID=1000$' Dockerfile
+grep -Eq '^FROM rocker/r-ver:[0-9.]+@sha256:[a-f0-9]{64}$' Dockerfile || fail "base image must be pinned by tag and digest"
+grep -Eq '^ARG CLAUDE_CODE_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' Dockerfile
+grep -Eq '^ARG CLAUDE_SHA256_AMD64=[a-f0-9]{64}$' Dockerfile
+grep -Eq '^ARG CLAUDE_SHA256_ARM64=[a-f0-9]{64}$' Dockerfile
+grep -q 'sha256sum -c' Dockerfile || fail "Claude binary checksum must be verified"
+if grep -Eq 'curl[^|]*\|[[:space:]]*(ba)?sh' Dockerfile proxy/Dockerfile; then fail "no curl | sh in Dockerfiles"; fi
+if grep -Eq '(^|[[:space:]])sudo([[:space:]]|$)' Dockerfile; then fail "no sudo in image"; fi
+grep -q 'libtbb-dev' Dockerfile
+grep -q 'libv8-dev' Dockerfile
+grep -q 'bubblewrap' Dockerfile
 
-# Exactly one host bind mount, and it must be the current project -> /workspace.
-[[ "$(grep -c 'type=bind' "$ROOT/ccode")" -eq 1 ]]
-grep -Fq 'type=bind,source=${PROJECT_DIR},target=/workspace' "$ROOT/ccode"
-grep -q -- '--add-dir' "$ROOT/ccode"
-grep -q -- '--mcp-config' "$ROOT/ccode"
+# --- Compose: container hardening, internal network, one project bind --------------------------
+grep -q 'read_only: true' docker-compose.yml
+grep -q 'cap_drop: \[ALL\]' docker-compose.yml
+grep -q 'no-new-privileges:true' docker-compose.yml
+grep -q 'pids_limit:' docker-compose.yml
+# Docker mounts tmpfs noexec by default; Stan/Rcpp models compile into tempdir() and load from it.
+grep -q '/tmp:rw,exec,' docker-compose.yml || fail "/tmp tmpfs must allow exec"
+grep -q 'mem_limit:' docker-compose.yml
+grep -q 'internal: true' docker-compose.yml
+if grep -Eq '(privileged|cap_add|network_mode|docker\.sock|env_file|user: *(root|"?0))' docker-compose.yml; then
+  fail "forbidden privilege/host option in docker-compose.yml"
+fi
+[[ "$(grep -cE '^\s+- \$\{WORKDIR' docker-compose.yml)" -eq 1 ]] || fail "exactly one host bind mount (WORKDIR)"
+grep -Fq '${WORKDIR:?' docker-compose.yml
+if grep -Eq '(~/\.ssh|~/\.aws|docker\.sock|/var/run)' docker-compose.yml claude-r || grep -Eq '\$\{?HOME' docker-compose.yml; then
+  fail "host credential/socket path referenced in compose or launcher"
+fi
 
-# Managed policy must fail closed and block project/user policy expansion.
+# --- Launcher guard rails ----------------------------------------------------------------------
+for flag in --add-dir --settings --mcp-config --permission-mode --dangerously-skip-permissions; do
+  grep -q -- "$flag" claude-r || fail "launcher must block $flag"
+done
+if grep -Eq '(--privileged|--cap-add|--network=host|--user[ =]root)' claude-r; then
+  fail "forbidden docker option in claude-r"
+fi
+
+# --- Windows launcher must keep the same guard rails as the bash launcher -----------------------
+for f in claude-r-win.ps1 install.ps1 install.cmd claude-r.cmd; do
+  [[ -f "$f" ]] || fail "missing $f"
+done
+for flag in --add-dir --settings --mcp-config --permission-mode --dangerously-skip-permissions; do
+  grep -q -- "$flag" claude-r-win.ps1 || fail "Windows launcher must block $flag"
+done
+grep -q 'CLAUDE_R_USE_API_KEY' claude-r-win.ps1
+grep -q '/workspace/.git/hooks:ro' claude-r-win.ps1 || fail "Windows launcher must mount .git/hooks read-only"
+grep -q '^\*\.ps1 text eol=crlf$' .gitattributes
+grep -q '^\* text=auto eol=lf$' .gitattributes || fail ".gitattributes must default to LF"
+
+# --- Proxy: deny by default ---------------------------------------------------------------------
+grep -q '^FilterDefaultDeny Yes$' proxy/tinyproxy.conf
+grep -Eq '^USER tinyproxy$' proxy/Dockerfile
+grep -q 'useradd .*tinyproxy' proxy/Dockerfile || fail "proxy Dockerfile must create the tinyproxy user"
+grep -Eq '^FROM debian:[a-z0-9-]+@sha256:[a-f0-9]{64}$' proxy/Dockerfile
+
+# --- Entrypoint ---------------------------------------------------------------------------------
+if grep -Eq '(^|[[:space:]])(sudo|su)([[:space:]]|$)' scripts/claude-r-entrypoint; then
+  fail "entrypoint must not elevate privileges"
+fi
+grep -q 'refusing to run Claude Code as root' scripts/claude-r-entrypoint
+
+# --- Managed policy must fail closed and block project/user policy expansion -------------------
 jq -e '
   .permissions.disableBypassPermissionsMode == "disable" and
   .permissions.blockReadsOutsideWorkingDirectories == true and
@@ -45,20 +96,16 @@ jq -e '
   .syncClaudeAiPlugins == false and
   .disableRemoteControl == true and
   .crossSessionInbound == "refuse"
-' "$ROOT/config/managed-settings.json" >/dev/null
+' config/managed-settings.json >/dev/null || fail "managed-settings.json is missing a required setting"
 
-if grep -Eq '(~/.ssh|~/.aws|docker\.sock|--privileged|--cap-add|--network=host|--user[ =]root)' "$ROOT/ccode"; then
-  echo "ERROR: forbidden host/security mount or privilege option found in ccode" >&2
-  exit 1
+# --- Line endings: CRLF breaks shebangs inside the image ----------------------------------------
+if grep -lr $'\r' Dockerfile docker-compose.yml claude-r install.sh scripts proxy config/CLAUDE.md 2>/dev/null; then
+  fail "CRLF line endings found (see .gitattributes)"
 fi
 
-if grep -Eq '(^|[[:space:]])(sudo|su)([[:space:]]|$)' "$ROOT/scripts/claude-r-entrypoint"; then
-  echo "ERROR: entrypoint must not elevate privileges" >&2
-  exit 1
+# --- CI ------------------------------------------------------------------------------------------
+if grep -Eq 'uses: [^@]+@v[0-9]' .github/workflows/*.yml; then
+  fail "GitHub Actions must be pinned to a commit SHA, not a tag"
 fi
 
-grep -q 'ARG R_VERSION=4.3.2' "$ROOT/Dockerfile"
-grep -q 'libtbb-dev' "$ROOT/Dockerfile"
-grep -q 'libv8-dev' "$ROOT/Dockerfile"
-grep -q 'r-full-4.3.2' "$ROOT/.github/workflows/docker-build.yml"
-echo "Static validation passed for r-full-4.3.2."
+echo "Static validation passed."

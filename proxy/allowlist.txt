@@ -1,0 +1,15 @@
+(^|\.)anthropic\.com$
+(^|\.)claude\.ai$
+(^|\.)claude\.com$
+(^|\.)r-project\.org$
+(^|\.)rstudio\.com$
+(^|\.)posit\.co$
+(^|\.)p3m\.dev$
+(^|\.)bioconductor\.org$
+(^|\.)r-universe\.dev$
+(^|\.)github\.com$
+(^|\.)githubusercontent\.com$
+(^|\.)gitlab\.com$
+(^|\.)bitbucket\.org$
+(^|\.)pypi\.org$
+(^|\.)pythonhosted\.org$

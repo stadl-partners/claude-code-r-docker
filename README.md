@@ -1,157 +1,87 @@
-# Claude Code R Docker — `r-full-4.3.2`
+# Claude Code R sandbox
 
-A reusable, non-root Claude Code environment for R projects. The only host directory bind-mounted into the container is the directory from which you run `ccode`.
+Claude Code in a locked-down Docker container for R projects. It runs as the non-root user `claude`, sees only the project directory you launch it from, and can reach the internet only through an allowlist proxy.
+
+**Status:** `scripts/validate-repo` and `scripts/smoke-test` pass (images build; identity, read-only filesystem, pinned Claude, C++ compile, proxy allow/deny). Not yet verified: a full interactive Claude session, whether Claude's own sandbox starts inside the container, and the Windows installer.
+
+## Quick start
+
+Needs Docker (Docker Desktop on Windows/macOS) and git.
+
+**Linux, macOS, WSL**
+
+```bash
+./install.sh                 # symlinks claude-r into ~/.local/bin (add it to PATH if prompted)
+cd /path/to/your/r-project
+claude-r                     # first run builds the images (a few minutes), then /login
+```
+
+**Windows** (cmd, PowerShell, or the Git Bash terminal in VS Code / RStudio)
+
+```powershell
+.\install.cmd                # or .\install.ps1, or ./install.sh from Git Bash
+# restart open terminals (VS Code, RStudio) so the new PATH is picked up
+cd C:\path\to\your\r-project
+claude-r
+```
+
+On Windows the installer adds this repo's folder to your user PATH. `claude-r` then resolves to `claude-r.cmd` (PowerShell launcher) in cmd and PowerShell, and to the `claude-r` bash script in Git Bash. `install.sh --uninstall` / `install.ps1 -Uninstall` undo it. If an interactive session fails in Git Bash with "the input device is not a TTY", run it from PowerShell or the VS Code terminal instead, or prefix with `winpty`.
+
+`claude-r [--update | --no-update-check | --stop] [directory] [claude args...]`
+
+| Variable | Meaning |
+|---|---|
+| `CLAUDE_R_STACK=slim\|full` | `full` (default) adds geospatial, database, Stan/V8, image and Python libraries |
+| `CLAUDE_R_MEMORY`, `CLAUDE_R_CPUS` | container limits (default `8g`, `4`) |
+| `CLAUDE_R_USE_API_KEY=1` | forward `ANTHROPIC_API_KEY` (OAuth `/login` is the default and preferred) |
+| `CLAUDE_R_ALLOW_ANY_DIR=1` | allow a directory without an R project marker |
+| `CLAUDE_R_GIT_WRITABLE=1` | don't mount `.git/hooks` and `.git/config` read-only |
+
+The launcher builds the image for your host UID/GID, so files Claude writes are owned by you. It refuses `/`, `/home`, your home directory, non-R directories, and Claude flags that could widen the boundary (`--add-dir`, `--settings`, `--mcp-config`, `--permission-mode`, `--dangerously-skip-permissions`, ...). `claude-r --stop` removes the proxy, which otherwise stays up between sessions.
+
+## What is in the image
+
+- `rocker/r-ver` (R 4.3.2, pinned by digest) with system libraries for compiling R packages, `renv`, `pak`, `devtools`, `testthat`. CRAN is the official `https://cloud.r-project.org` (set in the site profile via `--build-arg CRAN_REPO=...`). Packages compile from source, so the first install of a big package is slower; use `renv.lock` for reproducible versions. Posit Package Manager is not used: its downloads were truncated in testing.
+- Claude Code, a native binary downloaded and checked against a pinned sha256 (`scripts/update-claude-pin` bumps version and hashes together). Auto-update is off.
+- `bubblewrap` and `socat` for Claude's Linux sandbox, a root-owned `/etc/claude-code/managed-settings.json` policy, and a root-owned `/etc/claude-code/CLAUDE.md` with R conventions.
+- `r-deps` (restore `renv.lock`, or install `DESCRIPTION` dependencies) and `r-pkg <pkg>...` (ad-hoc installs with `pak`). Both skip the project's `.Rprofile`.
 
 ## Security model
 
-- **Runtime is non-root.** Claude Code runs as `ruser`. The UID/GID are build arguments (default 1000/1000) so Linux users can match host project ownership without ever running Claude as root.
-- **One host bind mount only.** `ccode` mounts the current project directory at `/workspace`. It does not mount `$HOME`, `~/.ssh`, `~/.aws`, Docker sockets, Git credentials, or other host paths.
-- **Read-only container filesystem.** The launcher uses `--read-only`, drops all Linux capabilities, sets `no-new-privileges`, and limits PIDs.
-- **Managed Claude policy.** `/etc/claude-code/managed-settings.json` forces sandboxing, disables bypass mode, blocks reads outside working directories, ignores repository permission rules, and locks down hooks, MCP servers, plugins, sideload flags, account-synced extensions, remote control, and cross-session inbound access.
-- **Secret-file blocking.** `.env`, `.env.*`, `.Renviron`, `*.pem`, and `*.key` are denied through both Claude file permissions and the Bash OS sandbox. `R_ENVIRON_USER=/dev/null` also prevents R from automatically loading a project `.Renviron`.
-- **No host credentials forwarded by default.** Authentication state is kept in a Docker-managed named volume, not in a host bind mount. Bash subprocesses run with Claude/cloud credentials scrubbed.
-- **Restricted command network.** Sandboxed commands can reach common R, Bioconductor, Posit, GitHub/GitLab/Bitbucket, R-universe, and Python package hosts. Other command-line destinations are blocked by managed policy.
+1. **No root.** The image runs as `claude`; the entrypoint refuses uid 0; there is no sudo.
+2. **Container hardening.** Read-only root filesystem, all capabilities dropped, `no-new-privileges`, PID, memory and CPU limits, `/tmp` as a `nosuid,nodev` tmpfs that allows exec (Stan and Rcpp models are compiled and loaded from there).
+3. **One host mount.** Only the project directory is bind-mounted, plus a named volume `claude-home` (login state, R package cache). No `$HOME`, SSH keys, cloud credentials or Docker socket. `.git/hooks` and `.git/config` are mounted read-only, because git runs them on your host.
+4. **Network egress.** The container is on an `internal` Docker network with no route out. The only exit is the `proxy` container (tinyproxy, deny by default) which allows Anthropic, CRAN, Bioconductor, Posit, R-universe, GitHub/GitLab/Bitbucket and PyPI hosts (`proxy/allowlist.txt`).
+5. **Claude policy.** Managed settings force the sandbox, disable bypass mode, block reads outside the working directory and block repo-level hooks, MCP servers and plugins.
 
-Important: the project directory itself is intentionally mounted read-write so Claude can edit code. Secret files inside the project are therefore physically present in the bind mount, but Claude's managed file permissions and OS-level Bash sandbox deny access to the configured secret patterns. This is an access-control boundary, not a filtered copy of the repository. If a secret was committed to Git history, hard-linked/copied under another name, or embedded in another project file, it is project data and filename-based secret blocking cannot reliably hide it. Do not weaken or remove the managed sandbox if that boundary matters to you.
+Limits: the project directory is read-write, so secrets inside it are physically present. Claude's deny rules are defense in depth, not a guarantee. Use a sanitized copy when that matters. A project `.Rprofile` runs whenever R starts in `/workspace`; read it before running R in a project you don't trust. See [SECURITY.md](SECURITY.md).
 
-## R dependency model
-
-Use `renv` whenever possible.
-
-- `r-deps` restores `renv.lock` when present.
-- For R package source trees with `DESCRIPTION`, `r-deps` installs development dependencies with `pak`.
-- `r-pkg pkg1 pkg2` installs ad-hoc R packages with `pak`.
-- `renv`, `pak`, `devtools`, and `testthat` are preinstalled in the image.
-- Claude login state and R package caches live under a single Docker-managed `claude-code-r-state` volume, not in a host bind mount.
-
-For this full profile, the image also includes TBB, V8, and Clang for Stan-related compilation and interactive R tooling. `rstan`, `brms`, `shiny`, and the other R packages still come from the project lockfile; a missing `brms` entry is **not** silently added.
-
-The image contains a broad set of common compilation and system libraries (curl/SSL/XML, GDAL/GEOS/PROJ, database clients, image/font libraries, HDF5/NetCDF, etc.). **An arbitrary R package can still require an unusual OS library.** Because runtime is deliberately non-root, such an OS dependency must be added to the Dockerfile and the image rebuilt; do not add `sudo` or runtime `apt-get`.
-
-## Build via GitHub Actions (recommended)
-
-This R 4.3.2 image is built in GitHub Actions, not on your laptop. Push the
-repository to a private organization repository and push or merge to `main`.
-GitHub Actions automatically builds and publishes the image on every push to `main`;
-no manual trigger is needed.
-The workflow publishes `ghcr.io/ORG/REPO:r-full-4.3.2`. See the full private
-registry instructions below.
-
-The hosted runner builds for `linux/amd64` with R 4.3.2 and Claude Code
-2.1.310; OS dependencies are baked into the image, while individual projects
-restore their own R packages with `renv`.
-
-## Install the launcher
-
-Set your image and put `ccode` somewhere on your `PATH`:
+## R workflow
 
 ```bash
-export CLAUDE_R_IMAGE='ghcr.io/YOUR_ORG/YOUR_REPOSITORY:r-full-4.3.2'
-install -m 0755 ./ccode "$HOME/.local/bin/ccode"
+r-deps                                  # renv::restore() or install DESCRIPTION deps
+r-pkg ggplot2 dplyr                     # ad-hoc packages
+Rscript -e 'devtools::test()'
+Rscript -e 'devtools::check()'
 ```
 
-Or keep the script in this repository and call it directly.
+If a package needs a system library that isn't in the image, add it to the Dockerfile and rebuild. There is no sudo or runtime `apt`.
 
-The launcher refuses `/`, your home directory, and directories that do not look like an R project. It also rejects Claude CLI flags such as `--add-dir`, `--settings`, `--plugin-dir`, and `--mcp-config` that could widen or replace the managed boundary. For an intentionally minimal R folder, opt in once:
+## Verify
 
 ```bash
-CLAUDE_R_ALLOW_ANY_DIR=1 ccode
+bash scripts/validate-repo                                      # static checks (needs jq)
+docker build -t claude-r-ci:full .
+docker build -t claude-r-proxy-ci ./proxy
+bash scripts/smoke-test claude-r-ci:full claude-r-proxy-ci      # identity, read-only FS, pinned Claude, proxy allow/deny
 ```
 
-## Authentication
+CI (`.github/workflows/docker-build.yml`) runs the same checks for `slim` and `full` on every PR and push, and publishes to GHCR from `main`. Published images carry UID/GID 1000; on any other host UID build locally with `claude-r`.
 
-Preferred: start `ccode` and use Claude's normal `/login` flow. Claude state is stored under `/state/home` in the Docker named volume `claude-code-r-state`; no host Claude configuration is mounted.
-
-API-key authentication is opt-in only:
+## Updating pins
 
 ```bash
-export ANTHROPIC_API_KEY='...'
-CLAUDE_R_USE_API_KEY=1 ccode
+scripts/update-claude-pin            # Claude Code stable; or pass a version
 ```
 
-The key is made available to the Claude Code parent process because the CLI needs it. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, the sandbox, and `/proc` read denial are used to keep Bash subprocesses from reading it. OAuth/login avoids passing a host API-key variable at all.
-
-## Typical R workflow
-
-Inside Claude Code, prefer these non-interactive commands:
-
-```bash
-r-deps
-Rscript -e "renv::status()"
-Rscript -e "devtools::test()"
-Rscript -e "devtools::check()"
-```
-
-For an ad-hoc dependency:
-
-```bash
-r-pkg ggplot2 dplyr
-```
-
-For tests that normally call external services, use mocks (`httptest2`, `httptest`, `mockery`) and dummy environment variables. Do not mount live `.Renviron`, `.env`, SSH, AWS, or cloud credentials into this container.
-
-## GitHub publishing
-
-The workflow builds pull requests without pushing, and publishes `linux/amd64` images to private GHCR from `main` and semantic-version tags (`v*`). Enable branch protection on `main` in GitHub and require PRs/status checks; use `development` as the normal integration branch.
-
-## Compatibility and verification
-
-The supplied example lockfile targets R 4.3.2. Copy it into **your actual project** as `renv.lock` and run `r-deps` there; do not install its 149 locked packages into the shared base image. The lockfile may include packages that require source compilation or remote repositories and restoration is not guaranteed until tested in the target image.
-
-Run `./scripts/validate-repo` locally (optional), then push to `main` and inspect the automatically started GitHub Actions build and published digest. After pulling the image, run `r-deps` inside a real project. No Docker build is claimed to have been run here.
-
-**Security limitation:** with a direct read-write bind of the working directory, files such as `.env` and `.Renviron` inside that directory exist in the container. Claude policy and sandbox restrictions are defense-in-depth, not a guarantee against malicious project scripts, plugins, package install hooks, symlink aliases, or Git history. For a strict guarantee that Claude cannot access those files, run it on a **sanitized separate working copy** containing no secrets. This tool never mounts your other host directories. Do not treat API-key subprocess scrubbing as a complete boundary against arbitrary user code.
-
-## GitHub Actions build (private organization repository)
-
-**No local build is needed.** Commit this toolkit to an organization repository
-with Actions enabled. The workflow `.github/workflows/docker-build.yml`:
-
-- Validates, builds, and publishes to `ghcr.io/ORG/REPO:r-full-4.3.2` on every push to `main`.
-- Does not use manual workflow triggers, tag triggers, or PR builds.
-- Uses the job's `GITHUB_TOKEN` with `packages: write`; no registry PAT or
-  registry secret is needed for publishing to the repository's package.
-- Builds `linux/amd64` to avoid slow QEMU cross-compilation on hosted runners.
-  Apple Silicon users who need native `arm64` can extend the platform list
-  and enable QEMU or dedicated ARM runners.
-- Produces SHA-based tags and an image digest for pinning, with SBOM and
-  minimal provenance.
-
-**Private package setup:** The first published GHCR image normally defaults
-private. Confirm visibility under your organization's Packages settings; do
-not change it to public. If a package of the same name already exists, ensure
-this repository has **Actions access: Write** to that package. An organization
-administrator may need to enable GitHub Actions and allow third-party actions.
-
-To pull from a laptop, authenticate with a GitHub **personal access token
-(classic)** with `read:packages`, authorized for your organization if SSO is
-required, and with permission to read the image. Do **not** put this token in
-`.env`, `.Renviron`, an R project, or a Docker build argument:
-
-```bash
-# Create a PAT (classic) in GitHub settings, select read:packages.
-# Enter it through stdin, without saving it in project files:
-read -rsp 'GHCR token: ' GHCR_TOKEN; echo
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
-unset GHCR_TOKEN
-
-export CLAUDE_R_IMAGE=ghcr.io/YOUR_ORG/YOUR_REPOSITORY:r-full-4.3.2
-cd /path/to/your/r-project
-/path/to/ccode
-```
-
-The launcher runs `docker pull` on each invocation before launching. Docker's
-registry credentials are handled by Docker on the host; they are **not**
-mounted into the Claude container. Consider configuring a Docker credential
-helper to protect the login token. The image and the repository are separate
-access-control objects; only grant package read access to intended users.
-
-For reproducibility, prefer an immutable `@sha256:<digest>` image reference
-from the successful workflow rather than a moving tag.
-
-**Host security caveat:** The chosen project is still mounted read-write at
-`/workspace`; if it contains secrets, the container can potentially access
-them despite assistant/tool-level denial rules. Use a sanitized project copy
-when absolute secret separation is required. Runtime network access allows
-packages and tools to download dependencies, so do not run untrusted code
-or packages with real credentials in the workspace.
+The base image digest and GitHub Action SHAs are updated by hand or with Renovate (not configured yet).

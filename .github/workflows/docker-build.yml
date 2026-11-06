@@ -1,6 +1,7 @@
-name: Validate and publish R full 4.3.2
+name: Validate, test and publish
 
 on:
+  pull_request:
   push:
     branches: [main]
 
@@ -9,7 +10,7 @@ permissions:
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -17,42 +18,78 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [slim, full]
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate repository
         run: bash scripts/validate-repo
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Read R version from the Dockerfile
+        id: rver
+        run: echo "version=$(sed -n 's/^FROM rocker\/r-ver:\([0-9.]*\)@.*/\1/p' Dockerfile)" >> "$GITHUB_OUTPUT"
 
-      - name: Login to private GHCR package
-        uses: docker/login-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Built for the runner's UID (1000), loaded locally, and smoke-tested before anything is pushed.
+      - name: Build claude image (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: claude-r-ci:${{ matrix.stack }}
+          build-args: |
+            R_STACK=${{ matrix.stack }}
+          cache-from: type=gha,scope=r-${{ matrix.stack }}
+          cache-to: type=gha,mode=max,scope=r-${{ matrix.stack }}
+
+      - name: Build proxy image (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: proxy
+          platforms: linux/amd64
+          load: true
+          tags: claude-r-proxy-ci:latest
+
+      - name: Smoke test
+        run: bash scripts/smoke-test claude-r-ci:${{ matrix.stack }} claude-r-proxy-ci:latest
+
+      - name: Login to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate tags and OCI labels
+        if: github.event_name == 'push'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=r-full-4.3.2
-            type=sha,prefix=r-full-4.3.2-
+            type=raw,value=r-${{ matrix.stack }}-${{ steps.rver.outputs.version }}
+            type=sha,prefix=r-${{ matrix.stack }}-${{ steps.rver.outputs.version }}-
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Non-root Claude Code R 4.3.2 development container
+            org.opencontainers.image.description=Non-root Claude Code R ${{ steps.rver.outputs.version }} (${{ matrix.stack }}) development container
 
-      - name: Build and publish
-        id: build
-        uses: docker/build-push-action@v6
+      # Prebuilt images carry UID/GID 1000; on other host UIDs build locally with claude-r instead.
+      - name: Publish
+        if: github.event_name == 'push'
+        id: publish
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -60,12 +97,11 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            R_VERSION=4.3.2
-            R_STACK=full
-          cache-from: type=gha,scope=r-full-4.3.2
-          cache-to: type=gha,mode=max,scope=r-full-4.3.2
+            R_STACK=${{ matrix.stack }}
+          cache-from: type=gha,scope=r-${{ matrix.stack }}
           provenance: mode=min
           sbom: true
 
       - name: Display immutable digest
-        run: echo 'Image digest ${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+        if: github.event_name == 'push'
+        run: echo 'r-${{ matrix.stack }} digest ${{ steps.publish.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"

@@ -18,3 +18,16 @@ renv/library
 .claude-r
 **/.claude-r
 *.zip
+example
+example/**
+.github
+README.md
+SECURITY.md
+proxy
+drafts
+claude-r
+claude-r.cmd
+claude-r-win.ps1
+install.sh
+install.cmd
+install.ps1

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Usage: claude-r [--update | --no-update-check | --stop] [directory] [claude args...]
+# Runs Claude Code (R image) in a container that sees only <directory> (default: $PWD).
+#   --update            pull upstream changes (if any), rebuild the images, and exit
+#   --no-update-check   skip the upstream check (also: CLAUDE_R_NO_CHECK=1)
+#   --stop              stop and remove the egress proxy (it stays up between sessions)
+# Env: CLAUDE_R_STACK=slim|full  CLAUDE_R_MEMORY=8g  CLAUDE_R_CPUS=4
+#      CLAUDE_R_USE_API_KEY=1 (forward ANTHROPIC_API_KEY)  CLAUDE_R_ALLOW_ANY_DIR=1
+#      CLAUDE_R_GIT_WRITABLE=1 (don't mount .git/hooks and .git/config read-only)
+set -euo pipefail
+
+resolve() {
+  realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || (cd "$1" && pwd -P)
+}
+
+repo="$(dirname "$(resolve "${BASH_SOURCE[0]}")")"
+compose=(docker compose -f "$repo/docker-compose.yml")
+
+# Tells the user when upstream has new commits and offers to pull. Silent when offline, up to
+# date, or throttled. $1 = "force" ignores the throttle and pulls without asking.
+check_upstream() {
+  local force="${1:-}" gitdir stamp now behind
+  gitdir="$(git -C "$repo" rev-parse --git-dir 2>/dev/null)" || return 0
+  [[ "$gitdir" = /* ]] || gitdir="$repo/$gitdir"
+  stamp="$gitdir/claude-r-last-check"
+  now="$(date +%s)"
+  if [[ -z "$force" && -f "$stamp" ]] && (( now - $(cat "$stamp" 2>/dev/null || echo 0) < 21600 )); then
+    :  # checked within the last 6h; still report what an earlier fetch already found
+  else
+    local t=()
+    command -v timeout >/dev/null 2>&1 && t=(timeout 5)
+    GIT_TERMINAL_PROMPT=0 "${t[@]}" git -C "$repo" fetch --quiet 2>/dev/null || return 0
+    echo "$now" >"$stamp" 2>/dev/null || true
+  fi
+  behind="$(git -C "$repo" rev-list --count 'HEAD..@{u}' 2>/dev/null)" || return 0
+  (( behind > 0 )) || return 0
+
+  echo "claude-r: $behind new commit(s) upstream:" >&2
+  git --no-pager -C "$repo" log --oneline --max-count=10 'HEAD..@{u}' >&2
+  if [[ -z "$force" ]]; then
+    [[ -t 0 && -t 2 ]] || return 0
+    local reply
+    read -r -p "Update now? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || return 0
+  fi
+  git -C "$repo" pull --ff-only --quiet >&2 \
+    || echo "claude-r: could not fast-forward (local changes or diverged); continuing with current version" >&2
+}
+
+update_only=0 skip_check="${CLAUDE_R_NO_CHECK:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --update) update_only=1; shift ;;
+    --no-update-check) skip_check=1; shift ;;
+    --stop) exec "${compose[@]}" down ;;
+    *) break ;;
+  esac
+done
+
+case "${CLAUDE_R_STACK:-full}" in
+  slim|full) ;;
+  *) echo "ERROR: CLAUDE_R_STACK must be slim or full." >&2; exit 64 ;;
+esac
+
+dir="$PWD"
+if [[ $# -gt 0 && -d "$1" ]]; then
+  dir="$1"
+  shift
+fi
+dir="$(resolve "$dir")"
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # Git Bash on Windows: Docker Desktop doesn't map host ownership, and
+    # compose needs C:/... paths rather than /c/... ones.
+    uid=1000 gid=1000
+    export COLORTERM="${COLORTERM-truecolor}"
+    dir_native="$(cygpath -m "$dir")"
+    repo="$(cygpath -m "$repo")"
+    compose=(docker compose -f "$repo/docker-compose.yml")
+    export MSYS_NO_PATHCONV=1 ;;
+  *)
+    uid="$(id -u)" gid="$(id -g)"
+    dir_native="$dir" ;;
+esac
+
+if (( uid == 0 )); then
+  echo "ERROR: refusing to build an image for uid 0; run this as your normal user." >&2
+  exit 64
+fi
+
+if (( update_only )); then
+  check_upstream force
+  HOST_UID="$uid" HOST_GID="$gid" WORKDIR="$dir_native" \
+    exec "${compose[@]}" build --pull
+fi
+[[ -z "$skip_check" ]] && check_upstream
+
+# --- Guard rails on what gets mounted -------------------------------------------------------
+case "$dir" in
+  /|/home|/Users|/root)
+    echo "ERROR: refusing to mount a broad system directory: $dir" >&2
+    exit 64 ;;
+esac
+if [[ -n "${HOME:-}" && "$dir" == "$(resolve "$HOME")" ]]; then
+  echo "ERROR: refusing to mount your entire home directory." >&2
+  exit 64
+fi
+if [[ "$dir" == *$'\n'* || "$dir" == *','* ]]; then
+  echo "ERROR: project path contains a newline or comma; move the project to a simpler path." >&2
+  exit 64
+fi
+
+# Per-invocation CLI flags must not widen or replace the managed security boundary.
+for arg in "$@"; do
+  case "$arg" in
+    --add-dir|--add-dir=*|--settings|--settings=*|--setting-sources|--setting-sources=*|\
+    --allowedTools|--allowedTools=*|--allowed-tools|--allowed-tools=*|\
+    --disallowedTools|--disallowedTools=*|--disallowed-tools|--disallowed-tools=*|\
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|\
+    --plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|--agents|--agents=*|\
+    --mcp-config|--mcp-config=*)
+      echo "ERROR: refusing Claude CLI option that can widen or replace the managed security boundary: $arg" >&2
+      exit 64 ;;
+  esac
+done
+
+if [[ "${CLAUDE_R_ALLOW_ANY_DIR:-0}" != "1" ]]; then
+  shopt -s nullglob
+  rproj=( "$dir"/*.Rproj )
+  if [[ ! -f "$dir/renv.lock" && ! -f "$dir/DESCRIPTION" && ! -d "$dir/R" && ! -d "$dir/tests" \
+        && ! -d "$dir/.git" && ${#rproj[@]} -eq 0 ]]; then
+    echo "ERROR: $dir does not look like an R project." >&2
+    echo "Run from the project root, or set CLAUDE_R_ALLOW_ANY_DIR=1 deliberately." >&2
+    exit 64
+  fi
+fi
+
+run_args=(--rm --build)
+
+# Git hooks and config are executed by git on the HOST later; keep them out of Claude's reach.
+if [[ "${CLAUDE_R_GIT_WRITABLE:-0}" != "1" && -d "$dir/.git" && ! -L "$dir/.git" ]]; then
+  [[ -d "$dir/.git/hooks" ]] && run_args+=(-v "$dir_native/.git/hooks:/workspace/.git/hooks:ro")
+  [[ -f "$dir/.git/config" ]] && run_args+=(-v "$dir_native/.git/config:/workspace/.git/config:ro")
+fi
+
+# No host credentials are forwarded by default. API-key mode is an explicit opt-in;
+# subscription/OAuth login (stored in the claude-home volume) is preferred.
+if [[ "${CLAUDE_R_USE_API_KEY:-0}" == "1" ]]; then
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "ERROR: CLAUDE_R_USE_API_KEY=1 but ANTHROPIC_API_KEY is not set." >&2
+    exit 65
+  fi
+  run_args+=(-e ANTHROPIC_API_KEY)
+fi
+
+# HOST_UID/HOST_GID keep file ownership in the mounted dir correct.
+HOST_UID="$uid" HOST_GID="$gid" WORKDIR="$dir_native" \
+  exec "${compose[@]}" run "${run_args[@]}" claude "$@"
